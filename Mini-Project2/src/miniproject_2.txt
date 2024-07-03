@@ -1,0 +1,166 @@
+Part 1 Setting up Cassandra
+1. Install Cassandra on Ubuntu VMs:
+- First, update the package index on each VM:
+	sudo apt-get update
+- Install Java if it's not already installed:
+	sudo apt-get install default-jdk
+- Add the Apache Cassandra repository to the package sources list:
+	echo "deb https://downloads.apache.org/cassandra/debian 41x main" | sudo tee -a /etc/apt/sources.list.d/cassandra.sources.list
+Note: Note: Replace '311x' with the appropriate version number
+- Add the Apache Cassandra repository keys:
+	curl https://downloads.apache.org/cassandra/KEYS | sudo apt-key add -
+- Update the package index again:
+	sudo apt-get update
+- Install Cassandra
+	sudo apt-get install cassandra
+2. Configure Cassandra nodes:
+- Navigate to the Cassandra configuration directory:
+	cd /etc/cassandra/
+- Edit the cassandra.yaml file:
+	sudo nano cassandra.yaml
+Adjust the following settings:
+- cluster_name: Set the name of your Cassandra cluster.
+- listen_address: Set the IP address for this node to listen on.
+- rpc_address: Set the IP address for remote procedure calls.
+- seeds: Add the IP addresses of all nodes in the cluster.
+- endpoint_snitch: Set to GossipingPropertyFileSnitch.
+- auto_bootstrap: Set to false for all nodes except the first node.
+- Save and exit the file.
+3. Start Cassandra nodes:
+- Start Cassandra on each node:
+	sudo systemctl start cassandra
+- Check the status to ensure it's running:
+	sudo systemctl status cassandra
+4. Verify cluster status:
+- Log into one of the nodes:
+	cqlsh
+- Check the status of the Cassandra cluster:
+	nodetool status
+- You should see all nodes listed and 'UN' (up and normal) status for each.
+
+Part 2: Import Data into Cassandra
+1. Create a Keyspace and Table:
+- Create a keyspace to contain our table:
+	CREATE KEYSPACE IF NOT EXISTS logs_keyspace WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
+- Create a table to store log data
+	CREATE TABLE IF NOT EXISTS logs_keyspace.logs_table_small (
+    		log_id INT PRIMARY KEY,
+    		ip_address TEXT,
+		path TEXT,
+		protocol TEXT,
+    		request_method TEXT,
+		request_timestamp TIMESTAMP,
+    		response_code TEXT,
+		size INT,
+    		user_agent TEXT,
+	);
+2. Import data into cassandra
+- Option 1: Using CQL COPY command:
+	COPY logs_keyspace.logs_table(id, timestamp, ip_address, request_method, path, protocol, response_code, size, user_agent)
+	FROM 'access_logs.csv'
+	WITH HEADER = true AND DELIMITER='β';
+- Option 2: Using DataStax Bulk Loader (dsbulk):
+	dsbulk load -url path_to_your_csv_file.csv -k logs_keyspace -t logs_table -h <Cassandra_host> -u <Cassandra_username> -p <Cassandra_password>
+3. Verify Data Import:
+- Connect to your Cassandra instance using cqlsh.
+- Query the data to ensure it has been imported successfully:
+	SELECT * FROM logs_keyspace.logs_table;
+
+Part 3: Operate Data in Cassandra
+1. SELECT COUNT(*) FROM logs_keyspace.logs_table WHERE request_method = 'GET' AND path = '/administrator/index.php';
+2. SELECT COUNT(*) FROM logs_keyspace.logs_table WHERE ip_address = '96.32.128.5';
+
+CREATE FUNCTION logs_keyspace.state_group_and_total( state map<text, int>, type text, amount int )
+CALLED ON NULL INPUT
+RETURNS map<text, int>
+LANGUAGE java AS '
+Integer count = (Integer) state.get(type);  if (count == null) count = amount; else count = count + amount; state.put(type, count); return state; ' ;
+
+
+CREATE OR REPLACE AGGREGATE logs_keyspace.logs_table.group_and_total(text, int) 
+SFUNC state_group_and_total 
+STYPE map<text, int> 
+INITCOND {};
+
+CREATE OR REPLACE FUNCTION logs_keyspace.state_group_count( state map<text, int>, type text )
+CALLED ON NULL INPUT
+RETURNS map<text, int>
+LANGUAGE java AS '
+Integer count = (Integer) state.get(type);  if (count == null) count = 1; else count++; state.put(type, count); return state; ' ;
+
+CREATE OR REPLACE AGGREGATE logs_keyspace.group_count(text) 
+SFUNC state_group_count 
+STYPE map<text, int> 
+INITCOND {};
+
+3. SELECT logs_keyspace.group_count(path) FROM logs_keyspace.logs_table_small;
+
+4. SELECT logs_keyspace.group_count(ip_address) FROM logs_keyspace.logs_table_small;
+
+
+CREATE CUSTOM INDEX user_agent_idx ON logs_keyspace.logs_table_small(user_agent) USING 'org.apache.cassandra.index.sasi.SASIIndex' WITH OPTIONS = {'mode':'CONTAINS', 'case_sensitive':'false'};
+
+5. SELECT COUNT(*) FROM logs_keyspace.logs_table_small WHERE user_agent LIKE '%Mozilla%';
+
+6. SELECT COUNT(*) FROM logs_keyspace.logs_table_small WHERE request_timestamp >= '2022-04-02T00:00:00' AND request_timestamp < '2022-04-03T00:00:00' AND request_method = 'GET' ALLOW FILTERING; 
+SELECT COUNT(*) FROM logs_keyspace.logs_table_test  WHERE request_timestamp >= '2022-04-02T00:00:00' AND request_timestamp < '2022-04-03T00:00:00' ALLOW FILTERING;
+
+7. SELECT COUNT(*) FROM logs_keyspace.logs_table_small WHERE size <= 404;
+
+CREATE OR REPLACE FUNCTION logs_keyspace.state_group_and_count( state map<text, int>, type text )
+CALLED ON NULL INPUT
+RETURNS map<text, int>
+LANGUAGE java AS '
+Integer count = (Integer) state.get(type);  if (count == null) count = 1; else count++; state.put(type, count); return state; ' ;
+
+
+CREATE OR REPLACE FUNCTION logs_keyspace.state_max_group_count (state map<text, int>)
+CALLED ON NULL INPUT
+RETURNS text LANGUAGE JAVA AS '
+    String maxValue = null;
+    int maxCount = 0;
+    String result = null;
+    for (String key : state.keySet()) {
+      int value = state.get(key);
+      if (value > maxCount) {
+        maxValue = key; maxCount = value;
+      }
+    }
+    result = maxValue + ": " + Integer.toString(maxCount);
+    return result; ' ;
+
+
+CREATE OR REPLACE AGGREGATE logs_keyspace.max_group_count(text)
+SFUNC state_group_and_count 
+STYPE map<text, int>
+FINALFUNC state_max_group_count
+INITCOND {};
+
+
+CREATE OR REPLACE FUNCTION logs_keyspace.state_group_count_having( state map<text, int>, type text )
+CALLED ON NULL INPUT
+RETURNS map<text, int>
+LANGUAGE java AS '
+Integer count = (Integer) state.get(type);  if (count == null) count = 1; else count++; state.put(type, count); return state; ' ;
+
+CREATE OR REPLACE FUNCTION logs_keyspace.group_count_having(state map<text, int>)
+CALLED ON NULL INPUT
+RETURNS text LANGUAGE JAVA AS '
+    String result = ""; 
+    for (String key : state.keySet()) {
+      int value = state.get(key);
+      if (value > 10) {
+        result += key + ": " + Integer.toString(value) +";";
+      }
+    }
+    return result; ' ;
+
+CREATE OR REPLACE AGGREGATE logs_keyspace.max_group_count_having(text)
+SFUNC state_group_count_having 
+STYPE map<text, int>
+FINALFUNC group_count_having
+INITCOND {};
+
+8. SELECT logs_keyspace.max_group_count_having(ip_address) FROM logs_keyspace.logs_table_small WHERE response_code='404'ALLOW FILTERING;
+If no IP fulfills the condition, then:
+SELECT logs_keyspace.max_group_count(ip_address) FROM logs_keyspace.logs_table_small;
